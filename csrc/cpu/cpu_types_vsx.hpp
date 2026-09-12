@@ -416,7 +416,8 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
       tmp.val[0] = two_x;
       tmp.val[1] = two_x;
       FP32Vec8 temp_vec(tmp);
-      vector float e = temp_vec.exp().reg.val[0];
+      FP32Vec8 exp_vec = temp_vec.exp();
+      vector float e = exp_vec.reg.val[0];
 
       vector float num = vec_sub(e, one);
       vector float den = vec_add(e, one);
@@ -600,57 +601,6 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
     reg.val[3] = data.reg.val[3];
   }
 
-  // De-pack 16 x 4-bit nibbles from a 64-bit value and look each up in a
-  // 16-element float LUT. Used by WNA16 (AWQ/GPTQ) dequantization.
-  explicit FP32Vec16(int64_t value, const FP32Vec16& lut) {
-    uint64_t uval = static_cast<uint64_t>(value);
-
-    // Process 4 floats per output vector register
-    for (int v = 0; v < 4; ++v) {
-      // Extract 4 nibble indices for this output vector
-      uint8_t n0 = (uval >> ((v * 4 + 0) * 4)) & 0xF;
-      uint8_t n1 = (uval >> ((v * 4 + 1) * 4)) & 0xF;
-      uint8_t n2 = (uval >> ((v * 4 + 2) * 4)) & 0xF;
-      uint8_t n3 = (uval >> ((v * 4 + 3) * 4)) & 0xF;
-
-      // Build permute control: index % 8 * 4 gives byte offset within a
-      // 32-byte window (two 16-byte LUT vectors concatenated).
-      alignas(16) uint8_t ctrl[16] = {
-          (uint8_t)((n0 % 8) * 4 + 0), (uint8_t)((n0 % 8) * 4 + 1),
-          (uint8_t)((n0 % 8) * 4 + 2), (uint8_t)((n0 % 8) * 4 + 3),
-          (uint8_t)((n1 % 8) * 4 + 0), (uint8_t)((n1 % 8) * 4 + 1),
-          (uint8_t)((n1 % 8) * 4 + 2), (uint8_t)((n1 % 8) * 4 + 3),
-          (uint8_t)((n2 % 8) * 4 + 0), (uint8_t)((n2 % 8) * 4 + 1),
-          (uint8_t)((n2 % 8) * 4 + 2), (uint8_t)((n2 % 8) * 4 + 3),
-          (uint8_t)((n3 % 8) * 4 + 0), (uint8_t)((n3 % 8) * 4 + 1),
-          (uint8_t)((n3 % 8) * 4 + 2), (uint8_t)((n3 % 8) * 4 + 3),
-      };
-      __vector unsigned char perm =
-          (__vector unsigned char)vec_xl(0, (const signed char*)ctrl);
-
-      // Gather from both LUT halves via vec_perm (VPERM)
-      __vector unsigned char from_lo =
-          vec_perm((__vector unsigned char)lut.reg.val[0],
-                   (__vector unsigned char)lut.reg.val[1], perm);
-      __vector unsigned char from_hi =
-          vec_perm((__vector unsigned char)lut.reg.val[2],
-                   (__vector unsigned char)lut.reg.val[3], perm);
-
-      // Build selection mask: 0xFF bytes for indices >= 8, 0x00 otherwise
-      uint8_t m0 = (n0 >= 8) ? 0xFF : 0x00;
-      uint8_t m1 = (n1 >= 8) ? 0xFF : 0x00;
-      uint8_t m2 = (n2 >= 8) ? 0xFF : 0x00;
-      uint8_t m3 = (n3 >= 8) ? 0xFF : 0x00;
-      alignas(16) uint8_t sel[16] = {
-          m0, m0, m0, m0, m1, m1, m1, m1, m2, m2, m2, m2, m3, m3, m3, m3,
-      };
-      __vector __bool char mask =
-          (__vector __bool char)vec_xl(0, (const signed char*)sel);
-
-      reg.val[v] = (__vector float)vec_sel(from_lo, from_hi, mask);
-    }
-  }
-
   explicit FP32Vec16(const FP32Vec4& data) {
     reg.val[0] = data.reg;
     reg.val[1] = data.reg;
@@ -673,6 +623,55 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
   }
 
   explicit FP32Vec16(const BF16Vec8& v) : FP32Vec16(FP32Vec8(v)) {}
+
+  // De-pack 16 x 4-bit nibbles from a 64-bit value and look each up in a
+  // 16-element float LUT. Used by WNA16 (AWQ/GPTQ) dequantization.
+  // Fully vectorized using VSX / AltiVec intrinsics with zero stack stores.
+  FORCE_INLINE explicit FP32Vec16(int64_t value, const FP32Vec16& lut) {
+    __vector unsigned long long v_u64 = {
+        static_cast<unsigned long long>(value),
+        static_cast<unsigned long long>(value)};
+    __vector unsigned char v_bytes = (__vector unsigned char)v_u64;
+
+    const __vector unsigned char mask_0f = vec_splats((unsigned char)0x0F);
+    const __vector unsigned char shift_4 = vec_splats((unsigned char)4);
+    __vector unsigned char v_lo = vec_and(v_bytes, mask_0f);
+    __vector unsigned char v_hi = vec_sr(v_bytes, shift_4);
+
+    const __vector unsigned char perm_interleave = {
+        0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23};
+    __vector unsigned char n_all = vec_perm(v_lo, v_hi, perm_interleave);
+
+    const __vector unsigned char mask_7 = vec_splats((unsigned char)7);
+    const __vector unsigned char shift_2 = vec_splats((unsigned char)2);
+    const __vector unsigned char const_offsets = {
+        0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+
+    __vector unsigned char lut0 = (__vector unsigned char)lut.reg.val[0];
+    __vector unsigned char lut1 = (__vector unsigned char)lut.reg.val[1];
+    __vector unsigned char lut2 = (__vector unsigned char)lut.reg.val[2];
+    __vector unsigned char lut3 = (__vector unsigned char)lut.reg.val[3];
+
+#define DEQUANT_V(v, rep0, rep1, rep2, rep3)                                  \
+  do {                                                                        \
+    const __vector unsigned char perm_rep_##v = {                             \
+        rep0, rep0, rep0, rep0, rep1, rep1, rep1, rep1,                       \
+        rep2, rep2, rep2, rep2, rep3, rep3, rep3, rep3};                      \
+    __vector unsigned char n_rep = vec_perm(n_all, n_all, perm_rep_##v);     \
+    __vector unsigned char n_base = vec_sl(vec_and(n_rep, mask_7), shift_2); \
+    __vector unsigned char perm = vec_add(n_base, const_offsets);             \
+    __vector __bool char mask = vec_cmpgt(n_rep, mask_7);                     \
+    __vector unsigned char from_lo = vec_perm(lut0, lut1, perm);              \
+    __vector unsigned char from_hi = vec_perm(lut2, lut3, perm);              \
+    reg.val[v] = (__vector float)vec_sel(from_lo, from_hi, mask);             \
+  } while (0)
+
+    DEQUANT_V(0, 0, 1, 2, 3);
+    DEQUANT_V(1, 4, 5, 6, 7);
+    DEQUANT_V(2, 8, 9, 10, 11);
+    DEQUANT_V(3, 12, 13, 14, 15);
+#undef DEQUANT_V
+  }
 
   // FP8 stub: dead code on PowerPC (fp8 KV cache is x86-only), needed for
   // load_b_pair_vec template to compile on all platforms.
@@ -704,11 +703,6 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
                                 vec_sub(reg.val[1], b.reg.val[1]),
                                 vec_sub(reg.val[2], b.reg.val[2]),
                                 vec_sub(reg.val[3], b.reg.val[3])}));
-  }
-
-  FP32Vec16 operator-() const {
-    return FP32Vec16(
-        f32x4x4_t({-reg.val[0], -reg.val[1], -reg.val[2], -reg.val[3]}));
   }
 
   FP32Vec16 operator/(const FP32Vec16& b) const {
@@ -810,24 +804,6 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
     auto hi_e = hi.exp();
     return FP32Vec16(f32x4x4_t{lo_e.reg.val[0], lo_e.reg.val[1],
                                hi_e.reg.val[0], hi_e.reg.val[1]});
-  }
-
-  FP32Vec16 tanh() const {
-    FP32Vec8 lo(f32x4x2_t{reg.val[0], reg.val[1]});
-    FP32Vec8 hi(f32x4x2_t{reg.val[2], reg.val[3]});
-    auto lo_tanh = lo.tanh();
-    auto hi_tanh = hi.tanh();
-    return FP32Vec16(f32x4x4_t{lo_tanh.reg.val[0], lo_tanh.reg.val[1],
-                               hi_tanh.reg.val[0], hi_tanh.reg.val[1]});
-  }
-
-  FP32Vec16 er() const {
-    FP32Vec8 lo(f32x4x2_t{reg.val[0], reg.val[1]});
-    FP32Vec8 hi(f32x4x2_t{reg.val[2], reg.val[3]});
-    auto lo_er = lo.er();
-    auto hi_er = hi.er();
-    return FP32Vec16(f32x4x4_t{lo_er.reg.val[0], lo_er.reg.val[1],
-                               hi_er.reg.val[0], hi_er.reg.val[1]});
   }
 
   float reduce_max() {
