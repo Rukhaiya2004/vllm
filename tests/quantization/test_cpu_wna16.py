@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
+import torch
 
-from vllm.platforms import current_platform
+from vllm.model_executor.kernels.linear.mixed_precision.cpu import _get_isa_hint
+from vllm.platforms import CpuArchEnum, current_platform
 
 if not current_platform.is_cpu():
     pytest.skip("skipping CPU-only tests", allow_module_level=True)
@@ -21,6 +23,16 @@ MODELS = [
     "RedHatAI/Qwen3-30B-A3B-quantized.w4a16",  # compressed-tensors W4A16 MoE
 ]
 DTYPE = ["bfloat16"]
+
+
+def test_cpu_wna16_power_bf16_uses_vsx(monkeypatch: pytest.MonkeyPatch):
+    """Use the POWER10 BF16 MMA microkernel instead of generic vectors."""
+    monkeypatch.setattr(
+        current_platform, "get_cpu_architecture", lambda: CpuArchEnum.POWERPC
+    )
+
+    assert _get_isa_hint(torch.bfloat16) == "vsx"
+    assert _get_isa_hint(torch.float16) == "vec"
 
 
 @pytest.mark.parametrize("model", MODELS)

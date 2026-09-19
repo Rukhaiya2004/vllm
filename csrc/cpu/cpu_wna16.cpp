@@ -7,6 +7,9 @@
 #if defined(__riscv_v)
   #include "cpu/micro_gemm/cpu_micro_gemm_rvv.hpp"
 #endif
+#if defined(__powerpc__)
+  #include "cpu/micro_gemm/cpu_micro_gemm_vsx.hpp"
+#endif
 #include "cpu/micro_gemm/cpu_micro_gemm_vec.hpp"
 
 #define VLLM_DISPATCH_CASE_16B_TYPES(...)                 \
@@ -119,8 +122,9 @@ class Dequantizer4b {
       scalar_vec_t output_vec_0(wb_0);
       scalar_vec_t output_vec_1(wb_1);
 
-      // AMX needs to interleave K elements to pack as 32 bits
-      if constexpr (isa == ISA::AMX) {
+      // AMX and POWER MMA consume adjacent K values interleaved per output
+      // channel.
+      if constexpr (isa == ISA::AMX || isa == ISA::VSX) {
         vec_op::interleave_save(output_vec_0, output_vec_1, curr_weight);
       } else {
         output_vec_0.save(curr_weight);
@@ -324,10 +328,14 @@ void cpu_gemm_wna16(
       return ISA::VEC;
     } else if (isa_hint == "rvv") {
       return ISA::RVV;
+    } else if (isa_hint == "vsx") {
+      return ISA::VSX;
     } else {
       TORCH_CHECK(false, "unsupported isa hint: " + isa_hint);
     }
   }();
+  TORCH_CHECK(isa != ISA::VSX || input.scalar_type() == at::kBFloat16,
+              "VSX W4A16 only supports bfloat16 activations");
 
   int32_t* zeros_ptr = has_zp ? zeros->data_ptr<int32_t>() : nullptr;
   const int64_t zeros_group_stride = has_zp ? zeros->stride(0) : 0;
@@ -427,6 +435,40 @@ void cpu_gemm_wna16(
         return;
       } else {
         using dequantizer_t = Dequantizer4b<scalar_t, ISA::RVV, false, false>;
+        cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
+            input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
+            output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
+        return;
+      }
+    } else if (isa == ISA::VSX) {
+      using gemm_t = cpu_micro_gemm::MicroGemm<ISA::VSX, scalar_t>;
+      if (has_zp) {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::VSX, true, false>;
+        cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
+            input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
+            output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
+        return;
+      }
+      if (use_desc_act) {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::VSX, false, true>;
+        cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
+            input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
+            output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
+        return;
+      } else {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::VSX, false, false>;
         cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
             input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
             output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
