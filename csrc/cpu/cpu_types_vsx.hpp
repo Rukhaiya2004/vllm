@@ -636,41 +636,26 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
     const __vector unsigned char mask_0f = vec_splats((unsigned char)0x0F);
     const __vector unsigned char shift_4 = vec_splats((unsigned char)4);
     __vector unsigned char v_lo = vec_and(v_bytes, mask_0f);
-    __vector unsigned char v_hi = vec_sr(v_bytes, shift_4);
+    __vector unsigned char v_hi = vec_sr(v_bytes, shift_4); // high nibbles shifted down, upper bits zero after shift_4
 
-    const __vector unsigned char perm_interleave = {
-        0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23};
-    __vector unsigned char n_all = vec_perm(v_lo, v_hi, perm_interleave);
+    // Interleave lo & hi nibbles into continuous bytes [n0, n1, n2, n3, ..., n15]
+    __vector unsigned char n_bytes = vec_mergeh(v_lo, v_hi);
 
-    const __vector unsigned char mask_7 = vec_splats((unsigned char)7);
-    const __vector unsigned char shift_2 = vec_splats((unsigned char)2);
-    const __vector unsigned char const_offsets = {
-        0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+    // Unpack 16 bytes directly into 16 x 32-bit integers
+    const __vector unsigned short vzero_s = {0};
+    __vector unsigned short u16_0 = (__vector unsigned short)vec_mergeh(n_bytes, (__vector unsigned char)vzero_s);
+    __vector unsigned short u16_1 = (__vector unsigned short)vec_mergel(n_bytes, (__vector unsigned char)vzero_s);
 
-    __vector unsigned char lut0 = (__vector unsigned char)lut.reg.val[0];
-    __vector unsigned char lut1 = (__vector unsigned char)lut.reg.val[1];
-    __vector unsigned char lut2 = (__vector unsigned char)lut.reg.val[2];
-    __vector unsigned char lut3 = (__vector unsigned char)lut.reg.val[3];
+    __vector signed int i32_0 = (__vector signed int)vec_mergeh(u16_0, vzero_s);
+    __vector signed int i32_1 = (__vector signed int)vec_mergel(u16_0, vzero_s);
+    __vector signed int i32_2 = (__vector signed int)vec_mergeh(u16_1, vzero_s);
+    __vector signed int i32_3 = (__vector signed int)vec_mergel(u16_1, vzero_s);
 
-#define DEQUANT_V(v, rep0, rep1, rep2, rep3)                                  \
-  do {                                                                        \
-    const __vector unsigned char perm_rep_##v = {                             \
-        rep0, rep0, rep0, rep0, rep1, rep1, rep1, rep1,                       \
-        rep2, rep2, rep2, rep2, rep3, rep3, rep3, rep3};                      \
-    __vector unsigned char n_rep = vec_perm(n_all, n_all, perm_rep_##v);     \
-    __vector unsigned char n_base = vec_sl(vec_and(n_rep, mask_7), shift_2); \
-    __vector unsigned char perm = vec_add(n_base, const_offsets);             \
-    __vector __bool char mask = vec_cmpgt(n_rep, mask_7);                     \
-    __vector unsigned char from_lo = vec_perm(lut0, lut1, perm);              \
-    __vector unsigned char from_hi = vec_perm(lut2, lut3, perm);              \
-    reg.val[v] = (__vector float)vec_sel(from_lo, from_hi, mask);             \
-  } while (0)
-
-    DEQUANT_V(0, 0, 1, 2, 3);
-    DEQUANT_V(1, 4, 5, 6, 7);
-    DEQUANT_V(2, 8, 9, 10, 11);
-    DEQUANT_V(3, 12, 13, 14, 15);
-#undef DEQUANT_V
+    // Convert directly from 32-bit int to float with fused offset addition
+    reg.val[0] = vec_add(vec_ctf(i32_0, 0), lut.reg.val[0]);
+    reg.val[1] = vec_add(vec_ctf(i32_1, 0), lut.reg.val[0]);
+    reg.val[2] = vec_add(vec_ctf(i32_2, 0), lut.reg.val[0]);
+    reg.val[3] = vec_add(vec_ctf(i32_3, 0), lut.reg.val[0]);
   }
 
   // FP8 stub: dead code on PowerPC (fp8 KV cache is x86-only), needed for
@@ -1116,30 +1101,61 @@ inline void prefetch(const void* addr) {
   __asm__ __volatile__("dcbt 0, %0" : : "r"(addr) : "memory");
 }
 
+#ifdef _ARCH_PWR10
+// Direct fused FP32 -> BF16 conversion + interleave_save for POWER10
+// Converts 8 float32 vectors directly into 4 interleaved MMA-packed BF16 vectors
+// avoiding all intermediate pack/unpack vec_perm instructions.
+static FORCE_INLINE void dequant_interleave_save_fp32_to_bf16(
+    const FP32Vec16& v0, const FP32Vec16& v1, void* ptr) {
+  // v0 has FP32 values for output channel 0..15 at K=k0 (4 float vectors of 4 elements)
+  // v1 has FP32 values for output channel 0..15 at K=k1 (4 float vectors of 4 elements)
+  __vector signed short b0_0 = (__vector signed short)__builtin_vsx_xvcvspbf16((__vector unsigned char)v0.reg.val[0]);
+  __vector signed short b0_1 = (__vector signed short)__builtin_vsx_xvcvspbf16((__vector unsigned char)v0.reg.val[1]);
+  __vector signed short b0_2 = (__vector signed short)__builtin_vsx_xvcvspbf16((__vector unsigned char)v0.reg.val[2]);
+  __vector signed short b0_3 = (__vector signed short)__builtin_vsx_xvcvspbf16((__vector unsigned char)v0.reg.val[3]);
+
+  __vector signed short b1_0 = (__vector signed short)__builtin_vsx_xvcvspbf16((__vector unsigned char)v1.reg.val[0]);
+  __vector signed short b1_1 = (__vector signed short)__builtin_vsx_xvcvspbf16((__vector unsigned char)v1.reg.val[1]);
+  __vector signed short b1_2 = (__vector signed short)__builtin_vsx_xvcvspbf16((__vector unsigned char)v1.reg.val[2]);
+  __vector signed short b1_3 = (__vector signed short)__builtin_vsx_xvcvspbf16((__vector unsigned char)v1.reg.val[3]);
+
+  // Merge b0 and b1 using native VSX halfword merges (mergel selects odd 16-bit halfwords: bits 16..31)
+  __vector signed short out0 = vec_mergel(b0_0, b1_0);
+  __vector signed short out1 = vec_mergel(b0_1, b1_1);
+  __vector signed short out2 = vec_mergel(b0_2, b1_2);
+  __vector signed short out3 = vec_mergel(b0_3, b1_3);
+
+  vec_xst(out0, 0, reinterpret_cast<signed short*>(ptr));
+  vec_xst(out1, 16, reinterpret_cast<signed short*>(ptr));
+  vec_xst(out2, 32, reinterpret_cast<signed short*>(ptr));
+  vec_xst(out3, 48, reinterpret_cast<signed short*>(ptr));
+}
+#endif
+
 static void interleave_save(const BF16Vec16& vec0, const BF16Vec16& vec1,
                             void* ptr) {
-  alignas(16) uint16_t v0[BF16Vec16::VEC_ELEM_NUM];
-  alignas(16) uint16_t v1[BF16Vec16::VEC_ELEM_NUM];
-  vec0.save(v0);
-  vec1.save(v1);
-  auto* packed = reinterpret_cast<uint32_t*>(ptr);
-  for (int i = 0; i < BF16Vec16::VEC_ELEM_NUM; ++i) {
-    packed[i] =
-        static_cast<uint32_t>(v0[i]) | (static_cast<uint32_t>(v1[i]) << 16);
-  }
+  __vector signed short h0 = vec_mergeh(vec0.reg.val[0], vec1.reg.val[0]);
+  __vector signed short l0 = vec_mergel(vec0.reg.val[0], vec1.reg.val[0]);
+  __vector signed short h1 = vec_mergeh(vec0.reg.val[1], vec1.reg.val[1]);
+  __vector signed short l1 = vec_mergel(vec0.reg.val[1], vec1.reg.val[1]);
+
+  vec_xst(h0, 0, reinterpret_cast<signed short*>(ptr));
+  vec_xst(l0, 16, reinterpret_cast<signed short*>(ptr));
+  vec_xst(h1, 32, reinterpret_cast<signed short*>(ptr));
+  vec_xst(l1, 48, reinterpret_cast<signed short*>(ptr));
 }
 
 static void interleave_save(const FP16Vec16& vec0, const FP16Vec16& vec1,
                             void* ptr) {
-  alignas(16) uint16_t v0[FP16Vec16::VEC_ELEM_NUM];
-  alignas(16) uint16_t v1[FP16Vec16::VEC_ELEM_NUM];
-  vec0.save(v0);
-  vec1.save(v1);
-  auto* packed = reinterpret_cast<uint32_t*>(ptr);
-  for (int i = 0; i < FP16Vec16::VEC_ELEM_NUM; ++i) {
-    packed[i] =
-        static_cast<uint32_t>(v0[i]) | (static_cast<uint32_t>(v1[i]) << 16);
-  }
+  __vector signed short h0 = vec_mergeh(vec0.reg.val[0], vec1.reg.val[0]);
+  __vector signed short l0 = vec_mergel(vec0.reg.val[0], vec1.reg.val[0]);
+  __vector signed short h1 = vec_mergeh(vec0.reg.val[1], vec1.reg.val[1]);
+  __vector signed short l1 = vec_mergel(vec0.reg.val[1], vec1.reg.val[1]);
+
+  vec_xst(h0, 0, reinterpret_cast<signed short*>(ptr));
+  vec_xst(l0, 16, reinterpret_cast<signed short*>(ptr));
+  vec_xst(h1, 32, reinterpret_cast<signed short*>(ptr));
+  vec_xst(l1, 48, reinterpret_cast<signed short*>(ptr));
 }
 
 struct INT8Vec64 {
@@ -1180,3 +1196,4 @@ struct INT8Vec64 {
 };
 }  // namespace vec_op
 #endif
+

@@ -58,46 +58,43 @@ class TileGemmVSX {
     }
 
     const __vector unsigned short vzero = {0};
-    const __vector unsigned char mask_k0 = {0,  1,  2,  3,  8,  9,  10, 11,
-                                            16, 17, 18, 19, 24, 25, 26, 27};
-    const __vector unsigned char mask_k1 = {4,  5,  6,  7,  12, 13, 14, 15,
-                                            20, 21, 22, 23, 28, 29, 30, 31};
+    const __vector unsigned char perm_k0 = {0, 1, 16, 17, 4, 5, 16, 17, 8, 9, 16, 17, 12, 13, 16, 17};
+    const __vector unsigned char perm_k1 = {2, 3, 16, 17, 6, 7, 16, 17, 10, 11, 16, 17, 14, 15, 16, 17};
 
     for (int32_t k_idx = 0; k_idx < k; k_idx += 2) {
       __vector float B_k0[4];
       __vector float B_k1[4];
 
-      for (int j = 0; j < 4; j++) {
-        __vector unsigned short vB_short = (__vector unsigned short)vec_xl(
-            0, (const unsigned char*)&b_ptr[k_idx * 16 + j * 8]);
-        __vector unsigned int vB_f32_01 =
-            (__vector unsigned int)vec_mergeh(vzero, vB_short);
-        __vector unsigned int vB_f32_23 =
-            (__vector unsigned int)vec_mergel(vzero, vB_short);
+      // Load and unpack B_k0, B_k1 directly
+      // In our layout, b_ptr[k_idx * 16 + j * 8] contains 4 pairs of [k0, k1] for 4 columns
+      __vector unsigned short vB0 = (__vector unsigned short)vec_xl(0, (const unsigned char*)&b_ptr[k_idx * 16 + 0]);
+      __vector unsigned short vB1 = (__vector unsigned short)vec_xl(0, (const unsigned char*)&b_ptr[k_idx * 16 + 8]);
+      __vector unsigned short vB2 = (__vector unsigned short)vec_xl(0, (const unsigned char*)&b_ptr[k_idx * 16 + 16]);
+      __vector unsigned short vB3 = (__vector unsigned short)vec_xl(0, (const unsigned char*)&b_ptr[k_idx * 16 + 24]);
 
-        B_k0[j] = vec_perm((__vector float)vB_f32_01, (__vector float)vB_f32_23,
-                           mask_k0);
-        B_k1[j] = vec_perm((__vector float)vB_f32_01, (__vector float)vB_f32_23,
-                           mask_k1);
-      }
+      B_k0[0] = (__vector float)vec_perm(vB0, vzero, perm_k0);
+      B_k1[0] = (__vector float)vec_perm(vB0, vzero, perm_k1);
+      B_k0[1] = (__vector float)vec_perm(vB1, vzero, perm_k0);
+      B_k1[1] = (__vector float)vec_perm(vB1, vzero, perm_k1);
+      B_k0[2] = (__vector float)vec_perm(vB2, vzero, perm_k0);
+      B_k1[2] = (__vector float)vec_perm(vB2, vzero, perm_k1);
+      B_k0[3] = (__vector float)vec_perm(vB3, vzero, perm_k0);
+      B_k1[3] = (__vector float)vec_perm(vB3, vzero, perm_k1);
 
+#pragma GCC unroll 2
       for (int i = 0; i < M; i++) {
-        uint32_t a_val;
-        std::memcpy(&a_val, &a_ptr[i * lda + k_idx], 4);
-        uint32_t a0_u = (a_val & 0xFFFF) << 16;
-        uint32_t a1_u = a_val & 0xFFFF0000;
-        float a0_f, a1_f;
-        std::memcpy(&a0_f, &a0_u, 4);
-        std::memcpy(&a1_f, &a1_u, 4);
+        __vector unsigned short vA = (__vector unsigned short)vec_splats(*reinterpret_cast<const uint32_t*>(&a_ptr[i * lda + k_idx]));
+        __vector float vA0 = (__vector float)vec_perm(vA, vzero, perm_k0);
+        __vector float vA1 = (__vector float)vec_perm(vA, vzero, perm_k1);
 
-        __vector float vA0 = vec_splats(a0_f);
-        __vector float vA1 = vec_splats(a1_f);
-
-#pragma GCC unroll 4
-        for (int j = 0; j < 4; j++) {
-          c_regs[i][j] = vec_madd(vA0, B_k0[j], c_regs[i][j]);
-          c_regs[i][j] = vec_madd(vA1, B_k1[j], c_regs[i][j]);
-        }
+        c_regs[i][0] = vec_madd(vA0, B_k0[0], c_regs[i][0]);
+        c_regs[i][0] = vec_madd(vA1, B_k1[0], c_regs[i][0]);
+        c_regs[i][1] = vec_madd(vA0, B_k0[1], c_regs[i][1]);
+        c_regs[i][1] = vec_madd(vA1, B_k1[1], c_regs[i][1]);
+        c_regs[i][2] = vec_madd(vA0, B_k0[2], c_regs[i][2]);
+        c_regs[i][2] = vec_madd(vA1, B_k1[2], c_regs[i][2]);
+        c_regs[i][3] = vec_madd(vA0, B_k0[3], c_regs[i][3]);
+        c_regs[i][3] = vec_madd(vA1, B_k1[3], c_regs[i][3]);
       }
     }
 
@@ -112,7 +109,7 @@ class TileGemmVSX {
   static void gemm_micro(DEFINE_CPU_MICRO_GEMM_PARAMS) {
     static_assert(0 < M && M <= 8);
 
-    if constexpr (M <= 4) {
+    if constexpr (M <= 2) {
       gemm_micro_vsx_fallback<M>(CPU_MICRO_GEMM_PARAMS);
       return;
     }
@@ -253,42 +250,57 @@ class TileGemmVSX {
             (__vector unsigned long long)l45, (__vector unsigned long long)l67);
       }
 
+      // Prefetch next B tile ahead to L1 cache
+      vec_op::prefetch(&b_ptr[(k_idx + 8) * 16]);
+
       // Load B and GER for k_idx + 0
       __vector unsigned char vB_vec_0[tiles_n];
+#pragma GCC unroll 4
       for (int j = 0; j < tiles_n; j++)
         vB_vec_0[j] =
             vec_xl(0, (const unsigned char*)&b_ptr[(k_idx + 0) * 16 + j * 8]);
+#pragma GCC unroll 2
       for (int i = 0; i < tiles_m; i++)
+#pragma GCC unroll 4
         for (int j = 0; j < tiles_n; j++)
           __builtin_mma_xvbf16ger2pp(
               &acc[i][j], (__vector unsigned char)vA_0[i], vB_vec_0[j]);
 
       // Load B and GER for k_idx + 2
       __vector unsigned char vB_vec_2[tiles_n];
+#pragma GCC unroll 4
       for (int j = 0; j < tiles_n; j++)
         vB_vec_2[j] =
             vec_xl(0, (const unsigned char*)&b_ptr[(k_idx + 2) * 16 + j * 8]);
+#pragma GCC unroll 2
       for (int i = 0; i < tiles_m; i++)
+#pragma GCC unroll 4
         for (int j = 0; j < tiles_n; j++)
           __builtin_mma_xvbf16ger2pp(
               &acc[i][j], (__vector unsigned char)vA_2[i], vB_vec_2[j]);
 
       // Load B and GER for k_idx + 4
       __vector unsigned char vB_vec_4[tiles_n];
+#pragma GCC unroll 4
       for (int j = 0; j < tiles_n; j++)
         vB_vec_4[j] =
             vec_xl(0, (const unsigned char*)&b_ptr[(k_idx + 4) * 16 + j * 8]);
+#pragma GCC unroll 2
       for (int i = 0; i < tiles_m; i++)
+#pragma GCC unroll 4
         for (int j = 0; j < tiles_n; j++)
           __builtin_mma_xvbf16ger2pp(
               &acc[i][j], (__vector unsigned char)vA_4[i], vB_vec_4[j]);
 
       // Load B and GER for k_idx + 6
       __vector unsigned char vB_vec_6[tiles_n];
+#pragma GCC unroll 4
       for (int j = 0; j < tiles_n; j++)
         vB_vec_6[j] =
             vec_xl(0, (const unsigned char*)&b_ptr[(k_idx + 6) * 16 + j * 8]);
+#pragma GCC unroll 2
       for (int i = 0; i < tiles_m; i++)
+#pragma GCC unroll 4
         for (int j = 0; j < tiles_n; j++)
           __builtin_mma_xvbf16ger2pp(
               &acc[i][j], (__vector unsigned char)vA_6[i], vB_vec_6[j]);
@@ -443,3 +455,4 @@ class MicroGemm<cpu_utils::ISA::VSX, scalar_t> {
 }  // namespace cpu_micro_gemm
 
 #endif
+
