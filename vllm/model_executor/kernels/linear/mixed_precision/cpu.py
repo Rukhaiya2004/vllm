@@ -167,14 +167,14 @@ class CPUWNA16LinearKernel(MPLinearKernel):
 
         supports_amx = torch.cpu._is_amx_tile_supported()
         supports_riscv = current_platform.get_cpu_architecture() == CpuArchEnum.RISCV
-        layer.use_w4a8 = (
+        use_w4a8 = (
             envs.VLLM_CPU_INT4_W4A8
             and self.config.act_type == torch.bfloat16
             and (supports_amx or supports_riscv)
         )
-        # layer.use_w4a8 = False
+        layer.use_w4a8 = use_w4a8
         # AWQ format will be converted to GPTQ format in `AutoAWQMarlinLinearMethod`
-        if layer.use_w4a8:
+        if use_w4a8:
             self._process_gptq_weights_w4a8(layer)
         else:
             self._process_gptq_weights_w4a16(layer)
@@ -186,7 +186,8 @@ class CPUWNA16LinearKernel(MPLinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         w_q, w_s, w_zp = self._get_weight_params(layer)
-        if layer.use_w4a8:
+        if getattr(layer, "use_w4a8", False):
+            assert w_zp is not None
             x = ops.int4_scaled_mm_cpu(
                 x=x,
                 w=w_q,
@@ -195,6 +196,7 @@ class CPUWNA16LinearKernel(MPLinearKernel):
                 bias=bias,
             )
         else:
+            isa_hint: str = getattr(layer, "isa_hint", "vec")
             x = ops.cpu_gemm_wna16(
                 input=x,
                 q_weight=w_q,
@@ -202,7 +204,7 @@ class CPUWNA16LinearKernel(MPLinearKernel):
                 zeros=w_zp,
                 bias=bias,
                 pack_factor=8,  # 32 // 4
-                isa_hint=layer.isa_hint,
+                isa_hint=isa_hint,
             )
         return x
 
@@ -213,5 +215,10 @@ def _get_isa_hint(dtype: torch.dtype) -> str:
         return "amx"
     elif current_platform.get_cpu_architecture() == CpuArchEnum.RISCV:
         return "rvv"
+    elif (
+        dtype == torch.bfloat16
+        and current_platform.get_cpu_architecture() == CpuArchEnum.POWERPC
+    ):
+        return "vsx"
     else:
         return "vec"

@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
+import torch
 
-from vllm.platforms import current_platform
+from vllm.model_executor.kernels.linear.mixed_precision.cpu import _get_isa_hint
+from vllm.platforms import CpuArchEnum, current_platform
 
 if not current_platform.is_cpu():
     pytest.skip("skipping CPU-only tests", allow_module_level=True)
 
 MODELS = [
     "TheBloke/TinyLlama-1.1B-Chat-v1.0-AWQ",
-    "Qwen/Qwen1.5-0.5B-Chat-GPTQ-Int4",
+    "TheBloke/TinyLlama-1.1B-Chat-v1.0-GPTQ",  # with g_idx
+    "Qwen/Qwen1.5-0.5B-Chat-GPTQ-Int4",  # without g_idx
     "RedHatAI/Qwen3-1.7B-quantized.w4a16",  # with zp
     "OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc",
     "Qwen/Qwen3-0.6B-FP8",  # FP8 W8A16 block-quantized linear
@@ -20,6 +23,16 @@ MODELS = [
     "RedHatAI/Qwen3-30B-A3B-quantized.w4a16",  # compressed-tensors W4A16 MoE
 ]
 DTYPE = ["bfloat16"]
+
+
+def test_cpu_wna16_power_bf16_uses_vsx(monkeypatch: pytest.MonkeyPatch):
+    """Use the POWER10 BF16 MMA microkernel instead of generic vectors."""
+    monkeypatch.setattr(
+        current_platform, "get_cpu_architecture", lambda: CpuArchEnum.POWERPC
+    )
+
+    assert _get_isa_hint(torch.bfloat16) == "vsx"
+    assert _get_isa_hint(torch.float16) == "vec"
 
 
 @pytest.mark.parametrize("model", MODELS)

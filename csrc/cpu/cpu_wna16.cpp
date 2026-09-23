@@ -7,6 +7,9 @@
 #if defined(__riscv_v)
   #include "cpu/micro_gemm/cpu_micro_gemm_rvv.hpp"
 #endif
+#if defined(__powerpc__)
+  #include "cpu/micro_gemm/cpu_micro_gemm_vsx.hpp"
+#endif
 #include "cpu/micro_gemm/cpu_micro_gemm_vec.hpp"
 
 #define VLLM_DISPATCH_CASE_16B_TYPES(...)                 \
@@ -37,7 +40,7 @@ namespace {
 using cpu_utils::ISA;
 using cpu_utils::VecTypeTrait;
 
-template <typename scalar_t, ISA isa, bool has_zp>
+template <typename scalar_t, ISA isa, bool has_zp, bool use_desc_act>
 class Dequantizer4b {
  public:
   constexpr static int32_t pack_num = 32 / 4;
@@ -47,22 +50,16 @@ class Dequantizer4b {
   static void dequant(int32_t* __restrict__ q_weight,
                       scalar_t* __restrict__ weight,
                       scalar_t* __restrict__ scales,
-                      int32_t* __restrict__ zeros, const int64_t scales_stride,
-                      const int64_t zeros_stride, const int32_t k_size,
-                      const int32_t group_size) {
+                      int32_t* __restrict__ zeros, int32_t* __restrict__ g_idx,
+                      const int64_t scales_stride, const int64_t zeros_stride,
+                      const int32_t k_size, const int32_t group_size) {
     vec_op::FP32Vec16 lut;
     if constexpr (has_zp) {
-      // AWQ
-      alignas(64) static const float LUT[16] = {
-          0.0f, 1.0f, 2.0f,  3.0f,  4.0f,  5.0f,  6.0f,  7.0f,
-          8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f};
-      lut = vec_op::FP32Vec16(LUT);
+      // AWQ (offset = 0.0f)
+      lut = vec_op::FP32Vec16(0.0f);
     } else {
-      // GPTQ
-      alignas(64) static const float LUT[16] = {
-          -8.0f, -7.0f, -6.0f, -5.0f, -4.0f, -3.0f, -2.0f, -1.0f,
-          0.0f,  1.0f,  2.0f,  3.0f,  4.0f,  5.0f,  6.0f,  7.0f};
-      lut = vec_op::FP32Vec16(LUT);
+      // GPTQ (offset = -8.0f)
+      lut = vec_op::FP32Vec16(-8.0f);
     }
 
     // per 64-bits elem contains 16 output channels
@@ -75,49 +72,163 @@ class Dequantizer4b {
     vec_op::FP32Vec16 zero_0;
     vec_op::FP32Vec16 zero_1;
     int32_t group_counter = 0;
-    for (int32_t k_idx = 0; k_idx < k_size; k_idx += 2) {
-      int64_t qwb_0 = *curr_q_weight;
-      int64_t qwb_1 = *(curr_q_weight + 1);
-      vec_op::FP32Vec16 wb_0(qwb_0, lut);
-      vec_op::FP32Vec16 wb_1(qwb_1, lut);
+    for (int32_t k_idx = 0; k_idx < k_size; k_idx += 8) {
+      vec_op::prefetch(curr_q_weight + 16);
+      vec_op::prefetch(curr_weight + 128);
 
-      if (group_counter == 0) {
-        scale_0 = vec_op::FP32Vec16(scalar_vec_t(curr_scale));
-        scale_1 = vec_op::FP32Vec16(scale_0);
-        curr_scale += scales_stride;
+      if constexpr (!use_desc_act) {
+        if (group_counter == 0) {
+          scale_0 = vec_op::FP32Vec16(scalar_vec_t(curr_scale));
+          curr_scale += scales_stride;
 
-        if constexpr (has_zp) {
-          zero_0 = vec_op::FP32Vec16(*curr_zeros, lut);
-          zero_1 = vec_op::FP32Vec16(zero_0);
-          curr_zeros += zeros_stride / 2;
+          if constexpr (has_zp) {
+            zero_0 = vec_op::FP32Vec16(*curr_zeros, lut);
+            curr_zeros += zeros_stride / 2;
+          }
         }
       }
 
-      if constexpr (has_zp) {
-        wb_0 = wb_0 - zero_0;
-        wb_1 = wb_1 - zero_1;
+      int64_t qwb_0 = *curr_q_weight;
+      int64_t qwb_1 = *(curr_q_weight + 1);
+      int64_t qwb_2 = *(curr_q_weight + 2);
+      int64_t qwb_3 = *(curr_q_weight + 3);
+      int64_t qwb_4 = *(curr_q_weight + 4);
+      int64_t qwb_5 = *(curr_q_weight + 5);
+      int64_t qwb_6 = *(curr_q_weight + 6);
+      int64_t qwb_7 = *(curr_q_weight + 7);
+
+      vec_op::FP32Vec16 wb_0(qwb_0, lut);
+      vec_op::FP32Vec16 wb_1(qwb_1, lut);
+      vec_op::FP32Vec16 wb_2(qwb_2, lut);
+      vec_op::FP32Vec16 wb_3(qwb_3, lut);
+      vec_op::FP32Vec16 wb_4(qwb_4, lut);
+      vec_op::FP32Vec16 wb_5(qwb_5, lut);
+      vec_op::FP32Vec16 wb_6(qwb_6, lut);
+      vec_op::FP32Vec16 wb_7(qwb_7, lut);
+
+      if constexpr (use_desc_act) {
+        int32_t g_idx_0 = g_idx[k_idx];
+        int32_t g_idx_1 = g_idx[k_idx + 1];
+        scale_0 = vec_op::FP32Vec16(
+            scalar_vec_t(curr_scale + g_idx_0 * scales_stride));
+        scale_1 = vec_op::FP32Vec16(
+            scalar_vec_t(curr_scale + g_idx_1 * scales_stride));
+        if constexpr (has_zp) {
+          zero_0 = vec_op::FP32Vec16(*(curr_zeros + g_idx_0 * zeros_stride / 2),
+                                     lut);
+          zero_1 = vec_op::FP32Vec16(*(curr_zeros + g_idx_1 * zeros_stride / 2),
+                                     lut);
+        }
+        if constexpr (has_zp) {
+          wb_0 = wb_0 - zero_0;
+          wb_1 = wb_1 - zero_1;
+          wb_2 = wb_2 - zero_0;
+          wb_3 = wb_3 - zero_1;
+          wb_4 = wb_4 - zero_0;
+          wb_5 = wb_5 - zero_1;
+          wb_6 = wb_6 - zero_0;
+          wb_7 = wb_7 - zero_1;
+        }
+        wb_0 = wb_0 * scale_0;
+        wb_1 = wb_1 * scale_1;
+        wb_2 = wb_2 * scale_0;
+        wb_3 = wb_3 * scale_1;
+        wb_4 = wb_4 * scale_0;
+        wb_5 = wb_5 * scale_1;
+        wb_6 = wb_6 * scale_0;
+        wb_7 = wb_7 * scale_1;
+      } else {
+        if constexpr (has_zp) {
+          wb_0 = wb_0 - zero_0;
+          wb_1 = wb_1 - zero_0;
+          wb_2 = wb_2 - zero_0;
+          wb_3 = wb_3 - zero_0;
+          wb_4 = wb_4 - zero_0;
+          wb_5 = wb_5 - zero_0;
+          wb_6 = wb_6 - zero_0;
+          wb_7 = wb_7 - zero_0;
+        }
+        wb_0 = wb_0 * scale_0;
+        wb_1 = wb_1 * scale_0;
+        wb_2 = wb_2 * scale_0;
+        wb_3 = wb_3 * scale_0;
+        wb_4 = wb_4 * scale_0;
+        wb_5 = wb_5 * scale_0;
+        wb_6 = wb_6 * scale_0;
+        wb_7 = wb_7 * scale_0;
       }
 
-      wb_0 = wb_0 * scale_0;
-      wb_1 = wb_1 * scale_1;
+#if defined(_ARCH_PWR10) && defined(__powerpc__)
+      if constexpr (isa == ISA::VSX &&
+                    std::is_same_v<scalar_t, c10::BFloat16>) {
+        vec_op::dequant_interleave_save_fp32_to_bf16(wb_0, wb_1, curr_weight);
+        vec_op::dequant_interleave_save_fp32_to_bf16(wb_2, wb_3,
+                                                     curr_weight + 32);
+        vec_op::dequant_interleave_save_fp32_to_bf16(wb_4, wb_5,
+                                                     curr_weight + 64);
+        vec_op::dequant_interleave_save_fp32_to_bf16(wb_6, wb_7,
+                                                     curr_weight + 96);
+      } else {
+        scalar_vec_t output_vec_0(wb_0);
+        scalar_vec_t output_vec_1(wb_1);
+        scalar_vec_t output_vec_2(wb_2);
+        scalar_vec_t output_vec_3(wb_3);
+        scalar_vec_t output_vec_4(wb_4);
+        scalar_vec_t output_vec_5(wb_5);
+        scalar_vec_t output_vec_6(wb_6);
+        scalar_vec_t output_vec_7(wb_7);
 
+        if constexpr (isa == ISA::AMX || isa == ISA::VSX) {
+          vec_op::interleave_save(output_vec_0, output_vec_1, curr_weight);
+          vec_op::interleave_save(output_vec_2, output_vec_3, curr_weight + 32);
+          vec_op::interleave_save(output_vec_4, output_vec_5, curr_weight + 64);
+          vec_op::interleave_save(output_vec_6, output_vec_7, curr_weight + 96);
+        } else {
+          output_vec_0.save(curr_weight);
+          output_vec_1.save(curr_weight + 16);
+          output_vec_2.save(curr_weight + 32);
+          output_vec_3.save(curr_weight + 48);
+          output_vec_4.save(curr_weight + 64);
+          output_vec_5.save(curr_weight + 80);
+          output_vec_6.save(curr_weight + 96);
+          output_vec_7.save(curr_weight + 112);
+        }
+      }
+#else
       scalar_vec_t output_vec_0(wb_0);
       scalar_vec_t output_vec_1(wb_1);
+      scalar_vec_t output_vec_2(wb_2);
+      scalar_vec_t output_vec_3(wb_3);
+      scalar_vec_t output_vec_4(wb_4);
+      scalar_vec_t output_vec_5(wb_5);
+      scalar_vec_t output_vec_6(wb_6);
+      scalar_vec_t output_vec_7(wb_7);
 
-      // AMX needs to interleave K elements to pack as 32 bits
-      if constexpr (isa == ISA::AMX) {
+      if constexpr (isa == ISA::AMX || isa == ISA::VSX) {
         vec_op::interleave_save(output_vec_0, output_vec_1, curr_weight);
+        vec_op::interleave_save(output_vec_2, output_vec_3, curr_weight + 32);
+        vec_op::interleave_save(output_vec_4, output_vec_5, curr_weight + 64);
+        vec_op::interleave_save(output_vec_6, output_vec_7, curr_weight + 96);
       } else {
         output_vec_0.save(curr_weight);
         output_vec_1.save(curr_weight + 16);
+        output_vec_2.save(curr_weight + 32);
+        output_vec_3.save(curr_weight + 48);
+        output_vec_4.save(curr_weight + 64);
+        output_vec_5.save(curr_weight + 80);
+        output_vec_6.save(curr_weight + 96);
+        output_vec_7.save(curr_weight + 112);
       }
+#endif
 
       // update
-      curr_q_weight += 2;
-      curr_weight += 32;
-      group_counter += 2;
-      if (group_counter == group_size) {
-        group_counter = 0;
+      curr_q_weight += 8;
+      curr_weight += 128;
+      if constexpr (!use_desc_act) {
+        group_counter += 8;
+        if (group_counter >= group_size) {
+          group_counter = 0;
+        }
       }
     }
   }
@@ -128,10 +239,11 @@ template <typename scalar_t, typename dequantizer_t, typename gemm_t>
 void cpu_gemm_wna16_impl(
     scalar_t* __restrict__ input, int32_t* __restrict__ q_weight,
     scalar_t* __restrict__ output, scalar_t* __restrict__ scales,
-    int32_t* __restrict__ zeros, scalar_t* __restrict__ bias,
-    const int32_t m_size, const int32_t n_size, const int32_t k_size,
-    const int64_t input_stride, const int64_t output_stride,
-    const int64_t scales_group_stride, const int64_t zeros_group_stride,
+    int32_t* __restrict__ zeros, int32_t* __restrict__ g_idx,
+    scalar_t* __restrict__ bias, const int32_t m_size, const int32_t n_size,
+    const int32_t k_size, const int64_t input_stride,
+    const int64_t output_stride, const int64_t scales_group_stride,
+    const int64_t zeros_group_stride, const int32_t group_num,
     const int32_t group_size, const int64_t pack_factor) {
   constexpr int32_t gemm_n_tile_size = gemm_t::NSize;
   constexpr int32_t gemm_m_tile_size = gemm_t::MaxMSize;
@@ -139,25 +251,29 @@ void cpu_gemm_wna16_impl(
   static_assert(gemm_n_tile_size % n_block_size == 0);
   const int32_t thread_num = cpu_utils::get_max_threads();
 
-  // a simple schedule policy, just to hold more B tiles in L2 and make sure
-  // each thread has tasks
+  // a schedule policy designed to fit in L2/L3 cache blocks and maximize
+  // per-thread work
   const int32_t n_partition_size = [&]() {
     const int64_t cache_size = cpu_utils::get_available_l2_size();
     int64_t ps_cache_limit = cache_size / (k_size * sizeof(scalar_t));
-    int64_t ps_thread_limit = n_size / thread_num;
+    int64_t ps_thread_limit = (n_size + thread_num - 1) / thread_num;
     ps_cache_limit =
         std::max((ps_cache_limit / gemm_n_tile_size) * gemm_n_tile_size,
                  (int64_t)gemm_n_tile_size);
     ps_thread_limit =
-        std::max((ps_thread_limit / gemm_n_tile_size) * gemm_n_tile_size,
+        std::max(((ps_thread_limit + gemm_n_tile_size - 1) / gemm_n_tile_size) *
+                     gemm_n_tile_size,
                  (int64_t)gemm_n_tile_size);
     return std::min(ps_cache_limit, ps_thread_limit);
   }();
   const int32_t task_num = (n_size + n_partition_size - 1) / n_partition_size;
 
   // get buffer size
-  const int64_t b_buffer_size =
-      (((n_partition_size * k_size * sizeof(scalar_t) + 63) / 64) * 64);
+  // Allocate 2 ping-pong tile buffers for B to double-buffer dequantization and
+  // GEMM
+  const int64_t tile_b_size =
+      (((gemm_n_tile_size * k_size * sizeof(scalar_t) + 63) / 64) * 64);
+  const int64_t b_buffer_size = tile_b_size * 2;
   const int64_t c_buffer_size =
       (((gemm_m_tile_size * gemm_n_tile_size * sizeof(float) + 63) / 64) * 64);
   const int64_t b_buffer_offset = 0;
@@ -199,71 +315,84 @@ void cpu_gemm_wna16_impl(
       const int32_t n_block_start_idx = n_start_idx / n_block_size;
       const int32_t n_num = std::min(n_partition_size, n_size - n_start_idx);
       const int32_t n_block_num = n_num / n_block_size;
-      // std::printf("thread_id: %d, task_id: %d, n_start_idx: %d, n_num: %d\n",
-      // thread_id, task_id, n_start_idx, n_num);
 
-      // dequant weight
-      {
+      const int32_t n_tile_num = n_num / gemm_n_tile_size;
+      const int32_t blocks_per_tile = gemm_n_tile_size / n_block_size;
+      scalar_t* __restrict__ init_bias =
+          (bias != nullptr) ? (bias + n_start_idx) : nullptr;
+      scalar_t* __restrict__ init_output = output + n_start_idx;
+
+      // Helper lambda to dequantize a specific tile into the designated
+      // ping-pong buffer
+      auto dequant_tile = [&](int32_t tile_idx, scalar_t* dest_b_buf) {
+        const int32_t tile_n_block_start =
+            n_block_start_idx + tile_idx * blocks_per_tile;
+        const int32_t tile_n_start = n_start_idx + tile_idx * gemm_n_tile_size;
         int32_t* __restrict__ curr_q_weight =
-            q_weight + n_block_start_idx * q_weight_block_stride;
-        scalar_t* __restrict__ curr_b_buffer = b_buffer;
-        scalar_t* __restrict__ curr_scales = scales + n_start_idx;
-        int32_t* __restrict__ curr_zeros = zeros + n_start_idx / pack_factor;
-        for (int32_t block_idx = 0; block_idx < n_block_num; ++block_idx) {
-          dequantizer_t::dequant(curr_q_weight, curr_b_buffer, curr_scales,
-                                 curr_zeros, scales_group_stride,
+            q_weight + tile_n_block_start * q_weight_block_stride;
+        scalar_t* __restrict__ curr_b_ptr = dest_b_buf;
+        scalar_t* __restrict__ curr_scales = scales + tile_n_start;
+        int32_t* __restrict__ curr_zeros = zeros + tile_n_start / pack_factor;
+
+        for (int32_t block_idx = 0; block_idx < blocks_per_tile; ++block_idx) {
+          dequantizer_t::dequant(curr_q_weight, curr_b_ptr, curr_scales,
+                                 curr_zeros, g_idx, scales_group_stride,
                                  zeros_group_stride, k_size, group_size);
-
-          // if (block_idx == 0 && n_start_idx == 0) {
-          //     print_logits("depacked weight", curr_b_buffer, k_size,
-          //     n_block_size, n_block_size);
-          // }
-
-          // update
           curr_q_weight += q_weight_block_stride;
-          curr_b_buffer += b_buffer_block_stride;
+          curr_b_ptr += b_buffer_block_stride;
           curr_scales += n_block_size;
           curr_zeros += zeros_block_stride;
         }
-      }
+      };
 
-      // compute loop
-      {
-        const int32_t n_tile_num = n_num / gemm_n_tile_size;
-        scalar_t* __restrict__ curr_input = input;
-        scalar_t* __restrict__ init_bias = bias;
-        if (bias != nullptr) {
-          init_bias += n_start_idx;
-        }
-        scalar_t* __restrict__ init_output = output + n_start_idx;
-        for (int32_t m_idx = 0; m_idx < m_size; m_idx += gemm_m_tile_size) {
-          const int32_t curr_m_size =
-              std::min(gemm_m_tile_size, m_size - m_idx);
-          scalar_t* __restrict__ curr_b_buffer = b_buffer;
-          scalar_t* __restrict__ curr_bias = init_bias;
-          scalar_t* __restrict__ curr_output = init_output;
-          for (int32_t n_tile_idx = 0; n_tile_idx < n_tile_num; ++n_tile_idx) {
-            gemm.gemm(curr_input, curr_b_buffer, c_buffer, curr_m_size, k_size,
-                      input_stride, b_buffer_block_stride, gemm_n_tile_size,
-                      false);
+      if (n_tile_num > 0) {
+        // Pre-dequantize tile 0 into buffer 0
+        scalar_t* b_buf0 = b_buffer;
+        scalar_t* b_buf1 = b_buffer + (tile_b_size / sizeof(scalar_t));
+        dequant_tile(0, b_buf0);
+
+        for (int32_t n_tile_idx = 0; n_tile_idx < n_tile_num; ++n_tile_idx) {
+          scalar_t* curr_tile_b_buffer =
+              (n_tile_idx % 2 == 0) ? b_buf0 : b_buf1;
+          scalar_t* next_tile_b_buffer =
+              (n_tile_idx % 2 == 0) ? b_buf1 : b_buf0;
+
+          // Pipeline: Dequantize next tile (if any) while current tile is ready
+          // for GEMM
+          if (n_tile_idx + 1 < n_tile_num) {
+            dequant_tile(n_tile_idx + 1, next_tile_b_buffer);
+          }
+
+          // Compute GEMM for current tile while it resides in hot L1/L2 cache
+          scalar_t* __restrict__ curr_input = input;
+          scalar_t* __restrict__ curr_output =
+              init_output + n_tile_idx * gemm_n_tile_size;
+          scalar_t* __restrict__ curr_bias =
+              (init_bias != nullptr)
+                  ? (init_bias + n_tile_idx * gemm_n_tile_size)
+                  : nullptr;
+
+          for (int32_t m_idx = 0; m_idx < m_size; m_idx += gemm_m_tile_size) {
+            const int32_t curr_m_size =
+                std::min(gemm_m_tile_size, m_size - m_idx);
+
+            gemm.gemm(curr_input, curr_tile_b_buffer, c_buffer, curr_m_size,
+                      k_size, input_stride, b_buffer_block_stride,
+                      gemm_n_tile_size, false);
 
             if (bias != nullptr) {
               cpu_micro_gemm::bias_epilogue<gemm_n_tile_size>(
                   c_buffer, curr_output, curr_bias, curr_m_size,
                   gemm_n_tile_size, output_stride);
-              curr_bias += gemm_n_tile_size;
             } else {
               cpu_micro_gemm::default_epilogue<gemm_n_tile_size>(
                   c_buffer, curr_output, curr_m_size, gemm_n_tile_size,
                   output_stride);
             }
 
-            curr_b_buffer +=
-                b_buffer_block_stride * (gemm_n_tile_size / n_block_size);
-            curr_output += gemm_n_tile_size;
+            curr_input += gemm_m_tile_size * input_stride;
+            curr_output += gemm_m_tile_size * output_stride;
           }
-          curr_input += gemm_m_tile_size * input_stride;
-          init_output += gemm_m_tile_size * output_stride;
         }
       }
     }
@@ -278,7 +407,8 @@ void cpu_gemm_wna16(
     const torch::Tensor& scales,  // [group_num, N]
     const std::optional<torch::Tensor>&
         zeros,  // [group_num, N / pack_factor], packed as int32
-    const std::optional<torch::Tensor>& bias,  // [N]
+    const std::optional<torch::Tensor>& g_idx,  // [K]
+    const std::optional<torch::Tensor>& bias,   // [N]
     const int64_t pack_factor, const std::string& isa_hint) {
   using cpu_utils::ISA;
   TORCH_CHECK_EQ(pack_factor, 8);  // only supports 4bits
@@ -295,6 +425,8 @@ void cpu_gemm_wna16(
   const int64_t output_m_stride = output.stride(0);
 
   bool has_zp = zeros.has_value();
+  bool use_desc_act = g_idx.has_value();
+  TORCH_CHECK(!(has_zp && use_desc_act));
 
   ISA isa = [&]() {
     if (isa_hint == "amx") {
@@ -303,79 +435,154 @@ void cpu_gemm_wna16(
       return ISA::VEC;
     } else if (isa_hint == "rvv") {
       return ISA::RVV;
+    } else if (isa_hint == "vsx") {
+      return ISA::VSX;
     } else {
       TORCH_CHECK(false, "unsupported isa hint: " + isa_hint);
     }
   }();
+  TORCH_CHECK(isa != ISA::VSX || input.scalar_type() == at::kBFloat16,
+              "VSX W4A16 only supports bfloat16 activations");
 
   int32_t* zeros_ptr = has_zp ? zeros->data_ptr<int32_t>() : nullptr;
   const int64_t zeros_group_stride = has_zp ? zeros->stride(0) : 0;
+  int32_t* g_idx_ptr = use_desc_act ? g_idx->data_ptr<int32_t>() : nullptr;
 
   VLLM_DISPATCH_16B_TYPES(input.scalar_type(), "cpu_gemm_wna16", [&]() {
     if (isa == ISA::AMX) {
       using gemm_t = cpu_micro_gemm::MicroGemm<ISA::AMX, scalar_t>;
       if (has_zp) {
-        using dequantizer_t = Dequantizer4b<scalar_t, ISA::AMX, true>;
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::AMX, true, false>;
         cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
             input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
             output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
-            bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr, a_m_size,
-            b_n_size, a_k_size, a_m_stride, output_m_stride,
-            scales_group_stride, zeros_group_stride, group_size, pack_factor);
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
         return;
       }
-      {
-        using dequantizer_t = Dequantizer4b<scalar_t, ISA::AMX, false>;
+      if (use_desc_act) {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::AMX, false, true>;
         cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
             input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
             output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
-            bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr, a_m_size,
-            b_n_size, a_k_size, a_m_stride, output_m_stride,
-            scales_group_stride, zeros_group_stride, group_size, pack_factor);
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
+        return;
+      } else {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::AMX, false, false>;
+        cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
+            input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
+            output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
         return;
       }
     } else if (isa == ISA::VEC) {
       using gemm_t = cpu_micro_gemm::MicroGemm<ISA::VEC, scalar_t>;
       if (has_zp) {
-        using dequantizer_t = Dequantizer4b<scalar_t, ISA::VEC, true>;
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::VEC, true, false>;
         cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
             input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
             output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
-            bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr, a_m_size,
-            b_n_size, a_k_size, a_m_stride, output_m_stride,
-            scales_group_stride, zeros_group_stride, group_size, pack_factor);
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
         return;
       }
-      {
-        using dequantizer_t = Dequantizer4b<scalar_t, ISA::VEC, false>;
+      if (use_desc_act) {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::VEC, false, true>;
         cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
             input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
             output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
-            bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr, a_m_size,
-            b_n_size, a_k_size, a_m_stride, output_m_stride,
-            scales_group_stride, zeros_group_stride, group_size, pack_factor);
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
+        return;
+      } else {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::VEC, false, false>;
+        cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
+            input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
+            output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
         return;
       }
     } else if (isa == ISA::RVV) {
       using gemm_t = cpu_micro_gemm::MicroGemm<ISA::RVV, scalar_t>;
       if (has_zp) {
-        using dequantizer_t = Dequantizer4b<scalar_t, ISA::RVV, true>;
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::RVV, true, false>;
         cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
             input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
             output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
-            bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr, a_m_size,
-            b_n_size, a_k_size, a_m_stride, output_m_stride,
-            scales_group_stride, zeros_group_stride, group_size, pack_factor);
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
         return;
       }
-      {
-        using dequantizer_t = Dequantizer4b<scalar_t, ISA::RVV, false>;
+      if (use_desc_act) {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::RVV, false, true>;
         cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
             input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
             output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
-            bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr, a_m_size,
-            b_n_size, a_k_size, a_m_stride, output_m_stride,
-            scales_group_stride, zeros_group_stride, group_size, pack_factor);
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
+        return;
+      } else {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::RVV, false, false>;
+        cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
+            input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
+            output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
+        return;
+      }
+    } else if (isa == ISA::VSX) {
+      using gemm_t = cpu_micro_gemm::MicroGemm<ISA::VSX, scalar_t>;
+      if (has_zp) {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::VSX, true, false>;
+        cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
+            input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
+            output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
+        return;
+      }
+      if (use_desc_act) {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::VSX, false, true>;
+        cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
+            input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
+            output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
+        return;
+      } else {
+        using dequantizer_t = Dequantizer4b<scalar_t, ISA::VSX, false, false>;
+        cpu_gemm_wna16_impl<scalar_t, dequantizer_t, gemm_t>(
+            input.data_ptr<scalar_t>(), q_weight.data_ptr<int32_t>(),
+            output.data_ptr<scalar_t>(), scales.data_ptr<scalar_t>(), zeros_ptr,
+            g_idx_ptr, bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
+            a_m_size, b_n_size, a_k_size, a_m_stride, output_m_stride,
+            scales_group_stride, zeros_group_stride, group_num, group_size,
+            pack_factor);
         return;
       }
     }
