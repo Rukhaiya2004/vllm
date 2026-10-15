@@ -84,7 +84,8 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
                     const int32_t token_num, const int32_t expert_num,
                     const int32_t topk_num, const int32_t input_size_13,
                     const int32_t output_size_13, const int32_t input_size_2,
-                    const int32_t output_size_2, const bool skip_weighted) {
+                    const int32_t output_size_2, const bool skip_weighted,
+                    const int32_t* __restrict__ expert_map = nullptr) {
   using scalar_vec_t = typename cpu_utils::VecTypeTrait<scalar_t>::vec_t;
   constexpr int32_t gemm_n_tile_size = gemm_t::NSize;
   constexpr int32_t gemm_m_tile_size = gemm_t::MaxMSize;
@@ -221,7 +222,12 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
     std::memset(token_num_per_group_buffer, 0, expert_num * sizeof(int32_t));
     for (int32_t i = 0; i < token_num * topk_num; ++i) {
       int32_t curr_expert_id = topk_id[i];
-      ++token_num_per_group_buffer[curr_expert_id];
+      if (expert_map != nullptr) {
+        curr_expert_id = expert_map[curr_expert_id];
+      }
+      if (curr_expert_id >= 0 && curr_expert_id < expert_num) {
+        ++token_num_per_group_buffer[curr_expert_id];
+      }
     }
 
     int32_t token_num_sum = 0;
@@ -237,10 +243,17 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
       int32_t* curr_index_buffer = expand_token_id_index_buffer + i * topk_num;
       for (int32_t j = 0; j < topk_num; ++j) {
         int32_t curr_expert_id = curr_topk_id[j];
-        int32_t curr_index = token_index_buffer[curr_expert_id];
-        ++token_index_buffer[curr_expert_id];
-        expand_token_id_buffer[curr_index] = i;
-        curr_index_buffer[j] = curr_index;
+        if (expert_map != nullptr) {
+          curr_expert_id = expert_map[curr_expert_id];
+        }
+        if (curr_expert_id >= 0 && curr_expert_id < expert_num) {
+          int32_t curr_index = token_index_buffer[curr_expert_id];
+          ++token_index_buffer[curr_expert_id];
+          expand_token_id_buffer[curr_index] = i;
+          curr_index_buffer[j] = curr_index;
+        } else {
+          curr_index_buffer[j] = -1;
+        }
       }
     }
   }
@@ -573,81 +586,44 @@ void fused_moe_impl(scalar_t* __restrict__ output, scalar_t* __restrict__ input,
           *curr_weight = 1.0f;
         }
 
-        if (topk_num > 1) {
-          {
-            int32_t w2_output_idx = curr_expand_token_id_index_buffer[0];
-            float* __restrict__ w2_output_iter =
-                w2_gemm_output_buffer + w2_output_idx * output_size_2;
-            float* __restrict__ ws_output_buffer_iter = ws_output_buffer;
-            vec_op::FP32Vec16 weight_vec(curr_weight[0]);
-            for (int32_t i = 0; i < output_size_2; i += 16) {
-              vec_op::FP32Vec16 vec(w2_output_iter);
-              vec = vec * weight_vec;
-              vec.save(ws_output_buffer_iter);
+        // Initialize ws_output_buffer accumulator to 0
+        for (int32_t i = 0; i < output_size_2; i += 16) {
+          vec_op::FP32Vec16 zero_vec(0.0f);
+          zero_vec.save(ws_output_buffer + i);
+        }
 
-              // update
-              w2_output_iter += 16;
-              ws_output_buffer_iter += 16;
-            }
+        for (int32_t idx = 0; idx < topk_num; ++idx) {
+          int32_t w2_output_idx = curr_expand_token_id_index_buffer[idx];
+          if (w2_output_idx < 0) {
+            continue;
           }
-
-          {
-            for (int32_t idx = 1; idx < topk_num - 1; ++idx) {
-              int32_t w2_output_idx = curr_expand_token_id_index_buffer[idx];
-              float* __restrict__ w2_output_iter =
-                  w2_gemm_output_buffer + w2_output_idx * output_size_2;
-              float* __restrict__ ws_output_buffer_iter = ws_output_buffer;
-              vec_op::FP32Vec16 weight_vec(curr_weight[idx]);
-              for (int32_t i = 0; i < output_size_2; i += 16) {
-                vec_op::FP32Vec16 vec(w2_output_iter);
-                vec_op::FP32Vec16 sum(ws_output_buffer_iter);
-                sum = sum + vec * weight_vec;
-                sum.save(ws_output_buffer_iter);
-
-                // update
-                w2_output_iter += 16;
-                ws_output_buffer_iter += 16;
-              }
-            }
-          }
-
-          {
-            int32_t idx = topk_num - 1;
-            int32_t w2_output_idx = curr_expand_token_id_index_buffer[idx];
-            float* __restrict__ w2_output_iter =
-                w2_gemm_output_buffer + w2_output_idx * output_size_2;
-            float* __restrict__ ws_output_buffer_iter = ws_output_buffer;
-            scalar_t* __restrict__ curr_output_buffer_iter = curr_output_buffer;
-            vec_op::FP32Vec16 weight_vec(curr_weight[idx]);
-            for (int32_t i = 0; i < output_size_2; i += 16) {
-              vec_op::FP32Vec16 vec(w2_output_iter);
-              vec_op::FP32Vec16 sum(ws_output_buffer_iter);
-              sum = sum + vec * weight_vec;
-              scalar_vec_t out_vec(sum);
-              out_vec.save(curr_output_buffer_iter);
-
-              // update
-              w2_output_iter += 16;
-              ws_output_buffer_iter += 16;
-              curr_output_buffer_iter += 16;
-            }
-          }
-        } else {
-          int32_t w2_output_idx = curr_expand_token_id_index_buffer[0];
           float* __restrict__ w2_output_iter =
               w2_gemm_output_buffer + w2_output_idx * output_size_2;
-          scalar_t* __restrict__ curr_output_buffer_iter = curr_output_buffer;
-          vec_op::FP32Vec16 weight_vec(curr_weight[0]);
+          float* __restrict__ ws_output_buffer_iter = ws_output_buffer;
+          vec_op::FP32Vec16 weight_vec(curr_weight[idx]);
           for (int32_t i = 0; i < output_size_2; i += 16) {
             vec_op::FP32Vec16 vec(w2_output_iter);
-            vec = vec * weight_vec;
-            scalar_vec_t out_vec(vec);
-            out_vec.save(curr_output_buffer_iter);
+            vec_op::FP32Vec16 sum(ws_output_buffer_iter);
+            sum = sum + vec * weight_vec;
+            sum.save(ws_output_buffer_iter);
 
             // update
             w2_output_iter += 16;
-            curr_output_buffer_iter += 16;
+            ws_output_buffer_iter += 16;
           }
+        }
+
+        // Write accumulated sum to curr_output_buffer
+        float* __restrict__ ws_output_buffer_iter = ws_output_buffer;
+        scalar_t* __restrict__ curr_output_buffer_iter = curr_output_buffer;
+        for (int32_t i = 0; i < output_size_2; i += 16) {
+          vec_op::FP32Vec16 sum(ws_output_buffer_iter);
+          scalar_vec_t out_vec(sum);
+          out_vec.save(curr_output_buffer_iter);
+
+          // update
+          ws_output_buffer_iter += 16;
+          curr_output_buffer_iter += 16;
         }
       }
     }
@@ -691,7 +667,8 @@ void cpu_fused_moe(
     const std::optional<torch::Tensor>& w2_bias,  // [expert_num, output_size_2]
     const torch::Tensor& topk_weights,            // [token_num, k], float32
     const torch::Tensor& topk_id,                 // [token_num, k], int32
-    const bool skip_weighted, const std::string& act, const std::string& isa) {
+    const bool skip_weighted, const std::string& act, const std::string& isa,
+    const std::optional<torch::Tensor>& expert_map) {
   const int32_t token_num = input.size(0);
   const int32_t input_size_13 = input.size(1);
   const int64_t input_stride = input.stride(0);
@@ -706,6 +683,13 @@ void cpu_fused_moe(
   TORCH_CHECK(!skip_weighted || topk_num == 1,
               "skip_weighted is only supported for topk=1 on CPU");
 
+  const int32_t* __restrict__ expert_map_ptr = nullptr;
+  if (expert_map.has_value() && expert_map->defined()) {
+    TORCH_CHECK(expert_map->is_contiguous());
+    TORCH_CHECK_EQ(expert_map->dtype(), torch::kInt32);
+    expert_map_ptr = expert_map->data_ptr<int32_t>();
+  }
+
   VLLM_DISPATCH_FLOATING_TYPES(w13.scalar_type(), "cpu_fused_moe", [&]() {
     CPU_ISA_DISPATCH_IMPL(isa_type, [&]() {
       fused_moe_impl<scalar_t, scalar_t, gemm_t>(
@@ -715,7 +699,7 @@ void cpu_fused_moe(
           w2_bias.has_value() ? w2_bias->data_ptr<scalar_t>() : nullptr,
           topk_weights.data_ptr<float>(), topk_id.data_ptr<int32_t>(), act_type,
           token_num, expert_num, topk_num, input_size_13, output_size_13,
-          input_size_2, output_size_2, skip_weighted);
+          input_size_2, output_size_2, skip_weighted, expert_map_ptr);
     });
   });
 }
