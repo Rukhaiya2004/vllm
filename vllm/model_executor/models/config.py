@@ -308,12 +308,20 @@ class Gemma4Config(VerifyAndUpdateConfig):
                         head_dims,
                     )
         elif vllm_config.attention_config.backend is None:
-            vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
-            logger.info(
-                "Gemma4 model has heterogeneous head dimensions "
-                "%s. FA4 not available, forcing TRITON_ATTN backend.",
-                head_dims,
-            )
+            if current_platform.is_cpu():
+                vllm_config.attention_config.backend = AttentionBackendEnum.CPU_ATTN
+                logger.info(
+                    "Gemma4 model has heterogeneous head dimensions "
+                    "%s. FA4 not available on CPU, forcing CPU_ATTN backend.",
+                    head_dims,
+                )
+            else:
+                vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+                logger.info(
+                    "Gemma4 model has heterogeneous head dimensions "
+                    "%s. FA4 not available, forcing TRITON_ATTN backend.",
+                    head_dims,
+                )
 
 
 class EmbeddingGemma2ModelConfig(Gemma4Config):

@@ -5,16 +5,183 @@ import os
 from typing import Any
 
 import torch
+import torch.distributed
 from torch.distributed import ProcessGroup
 
 from vllm.distributed.utils import pickle
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Custom ops for CPU EP all_gatherv / reduce_scatterv.
+#
+# Registering these as custom ops creates an opaque boundary for
+# torch.compile / dynamo: the tracer calls the fake_impl (shape-only) and
+# never traces inside the real implementation, so runtime-valued chunk
+# sizes never appear as symbolic integers in the compiled graph.
+# ---------------------------------------------------------------------------
+
+# Registry: unique_name -> ProcessGroup.  Populated by CpuCommunicator.__init__
+# so the custom op impl can look up the correct group at runtime.
+_CPU_EP_GROUP_REGISTRY: dict[str, ProcessGroup] = {}
+
+
+def _cpu_all_gatherv_impl(
+    input_: torch.Tensor,
+    sizes: list[int],
+    group_name: str,
+) -> torch.Tensor:
+    """Real all_gatherv: pad → all_gather_single → slice."""
+    pg = _CPU_EP_GROUP_REGISTRY[group_name]
+    world_size = torch.distributed.get_world_size(pg)
+    max_size = int(max(sizes))
+    rest = input_.shape[1:]
+    local_rows = input_.shape[0]
+
+    if local_rows < max_size:
+        padding = input_.new_zeros((max_size - local_rows,) + rest)
+        padded = torch.cat([input_.contiguous(), padding], dim=0)
+    else:
+        padded = input_.contiguous()
+
+    gathered = torch.empty(
+        (world_size * max_size,) + rest,
+        dtype=input_.dtype,
+        device=input_.device,
+    )
+    torch.distributed.all_gather_single(gathered, padded, group=pg)
+
+    chunks = gathered.reshape(world_size, max_size, *rest)
+    return torch.cat(
+        [chunks[r, : int(sizes[r])] for r in range(world_size)], dim=0
+    )
+
+
+def _cpu_all_gatherv_fake(
+    input_: torch.Tensor,
+    sizes: list[int],
+    group_name: str,
+) -> torch.Tensor:
+    """Shape-only impl for torch.compile tracing."""
+    total_rows = sum(sizes)
+    return input_.new_empty((total_rows,) + input_.shape[1:])
+
+
+direct_register_custom_op(
+    op_name="cpu_all_gatherv",
+    op_func=_cpu_all_gatherv_impl,
+    fake_impl=_cpu_all_gatherv_fake,
+)
+
+
+def _cpu_all_to_allv_impl(
+    input_: torch.Tensor,
+    input_split_sizes: list[int],
+    output_split_sizes: list[int],
+    group_name: str,
+) -> torch.Tensor:
+    """Variable-size all-to-all: each rank sends input_split_sizes[r] rows to
+    rank r, and receives output_split_sizes[r] rows from rank r.
+
+    Uses torch.distributed.all_to_all_single which gloo supports natively and
+    handles zero-size chunks correctly (unlike all_to_all which rejects
+    zero-row tensors).  One round-trip, no padding, no post-slice.
+    """
+    pg = _CPU_EP_GROUP_REGISTRY[group_name]
+    rest = input_.shape[1:]
+    total_out = sum(output_split_sizes)
+
+    # Flatten trailing dims so all_to_all_single works on a 2-D tensor.
+    flat_size = 1
+    for s in rest:
+        flat_size *= s
+
+    output = input_.new_empty((total_out, flat_size) if flat_size > 1 else (total_out,))
+    inp_flat = input_.contiguous().view(-1, flat_size) if flat_size > 1 else input_.contiguous().view(-1)
+
+    torch.distributed.all_to_all_single(
+        output,
+        inp_flat,
+        output_split_sizes=[int(s) for s in output_split_sizes],
+        input_split_sizes=[int(s) for s in input_split_sizes],
+        group=pg,
+    )
+    # Restore original trailing shape.
+    return output.view((total_out,) + rest)
+
+
+def _cpu_all_to_allv_fake(
+    input_: torch.Tensor,
+    input_split_sizes: list[int],
+    output_split_sizes: list[int],
+    group_name: str,
+) -> torch.Tensor:
+    """Shape-only impl for torch.compile tracing."""
+    total_out = sum(output_split_sizes)
+    return input_.new_empty((total_out,) + input_.shape[1:])
+
+
+direct_register_custom_op(
+    op_name="cpu_all_to_allv",
+    op_func=_cpu_all_to_allv_impl,
+    fake_impl=_cpu_all_to_allv_fake,
+)
+
+
+def _cpu_reduce_scatterv_impl(
+    input_: torch.Tensor,
+    sizes: list[int],
+    group_name: str,
+    rank_in_group: int,
+) -> torch.Tensor:
+    """Real reduce_scatterv: split → reduce_scatter (list API) → this rank's chunk.
+
+    Uses the list-based torch.distributed.reduce_scatter which is universally
+    supported across torch versions (including older Power builds that do not
+    have the input_split_sizes kwarg on reduce_scatter_single).
+    """
+    pg = _CPU_EP_GROUP_REGISTRY[group_name]
+    rest = input_.shape[1:]
+    # Split along dim-0 according to per-rank sizes.
+    input_list = [
+        input_[start:start + int(s)].contiguous()
+        for start, s in zip(
+            [sum(int(x) for x in sizes[:r]) for r in range(len(sizes))],
+            sizes,
+        )
+    ]
+    chunk_size = int(sizes[rank_in_group])
+    output_tensor = torch.empty(
+        (chunk_size,) + rest,
+        dtype=input_.dtype,
+        device=input_.device,
+    )
+    torch.distributed.reduce_scatter(output_tensor, input_list, group=pg)
+    return output_tensor
+
+
+def _cpu_reduce_scatterv_fake(
+    input_: torch.Tensor,
+    sizes: list[int],
+    group_name: str,
+    rank_in_group: int,
+) -> torch.Tensor:
+    """Shape-only impl for torch.compile tracing."""
+    chunk_size = sizes[rank_in_group]
+    return input_.new_empty((chunk_size,) + input_.shape[1:])
+
+
+direct_register_custom_op(
+    op_name="cpu_reduce_scatterv",
+    op_func=_cpu_reduce_scatterv_impl,
+    fake_impl=_cpu_reduce_scatterv_fake,
+)
 
 
 class CpuCommunicator(DeviceCommunicatorBase):
@@ -52,6 +219,12 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
         # send/recv tensor_dict is only supported through the SHM communicator backend
         self.supports_tensor_dict = isinstance(self.dist_module, _CPUSHMDistributed)
+
+        # Register the device_group so the all_gatherv / reduce_scatterv custom
+        # ops can look it up by unique_name at runtime. This must happen for
+        # every communicator (not only the EP one): AgRsAll2AllManager may run
+        # the collectives on the DP or PCP group.
+        _CPU_EP_GROUP_REGISTRY[self.unique_name] = self.device_group
 
         if self.use_all2all:
             if self.all2all_backend not in (
@@ -144,6 +317,79 @@ class CpuCommunicator(DeviceCommunicatorBase):
             + input_size[dim + 1 :]
         )
         return output_tensor
+
+    def all_gatherv(
+        self,
+        input_: torch.Tensor | list[torch.Tensor],
+        dim: int = 0,
+        sizes: list[int] | None = None,
+    ) -> torch.Tensor | list[torch.Tensor]:
+        """Variable-size all-gather across the EP group (CPU / GLOO backend).
+
+        Each rank contributes sizes[rank] rows along dim 0.
+        Only dim=0 is supported -- this matches AgRsAll2AllManager usage.
+
+        Implemented as a registered custom op so that torch.compile treats it
+        as an opaque node: the tracer uses the shape-only fake_impl and never
+        sees the runtime chunk sizes as symbolic integers.
+        """
+        if dim != 0:
+            raise NotImplementedError(
+                "CpuCommunicator.all_gatherv only supports dim=0"
+            )
+
+        # List input: gather each tensor independently and return a list.
+        if isinstance(input_, list):
+            return [self.all_gatherv(t, dim=dim, sizes=sizes) for t in input_]
+
+        if sizes is None:
+            return self.all_gather(input_, dim=dim)
+
+        return torch.ops.vllm.cpu_all_gatherv(input_, sizes, self.unique_name)
+
+    def all_to_allv(
+        self,
+        input_: torch.Tensor,
+        input_split_sizes: list[int],
+        output_split_sizes: list[int],
+    ) -> torch.Tensor:
+        """Variable-size all-to-all across the EP group (CPU / GLOO backend).
+
+        Rank r sends input_split_sizes[r] rows to rank r and receives
+        output_split_sizes[r] rows from rank r.  One gloo round-trip, no
+        padding.
+
+        Implemented as a registered custom op for torch.compile compatibility.
+        """
+        return torch.ops.vllm.cpu_all_to_allv(
+            input_.contiguous(), input_split_sizes, output_split_sizes,
+            self.unique_name
+        )
+
+    def reduce_scatterv(
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+        sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Variable-size reduce-scatter across the EP group (CPU / GLOO backend).
+
+        Each rank receives sizes[rank] rows of the summed result along dim.
+
+        Implemented as a registered custom op so that torch.compile treats it
+        as an opaque node: the tracer uses the shape-only fake_impl and never
+        sees the runtime chunk sizes as symbolic integers.
+        """
+        if dim < 0:
+            dim += input_.dim()
+
+        if sizes is None:
+            return self.reduce_scatter(input_, dim=dim)
+
+        input_tensor = input_.movedim(dim, 0).contiguous()
+        return torch.ops.vllm.cpu_reduce_scatterv(
+            input_tensor, sizes, self.unique_name, self.rank_in_group
+        ).movedim(0, dim).contiguous()
 
     def send_tensor_dict(
         self,

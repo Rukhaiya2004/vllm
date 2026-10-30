@@ -191,15 +191,17 @@ class CPUWorker(Worker):
         # VLLM_CPU_CI_ENV always skips warmup to save CI time.
         if envs.VLLM_CPU_CI_ENV:
             return False
-        # With eager (CompilationMode.NONE) execution and an explicit KV
-        # cache size, warmup serves no purpose: there's no compiled graph to
-        # prewarm, and the auto KV-cache-size calc below -- which relies on
-        # a warmup forward pass having already bumped RSS to a realistic
-        # steady-state value -- is bypassed whenever the size is explicit.
-        return not (
-            self.compilation_config.mode == CompilationMode.NONE
-            and self.cache_config.kv_cache_memory_bytes is not None
-        )
+        # When an explicit KV cache size is given, the warmup forward pass
+        # serves no purpose: the auto KV-cache-size calc (which relies on the
+        # post-warmup RSS value) is bypassed entirely.  This applies regardless
+        # of compilation mode — on Power/ppc64le the platform sets
+        # DYNAMO_TRACE_ONCE, not NONE, so the original NONE-only guard caused
+        # EP=4 startup to hang: DP0 did a ~75s AOT compile inside
+        # determine_available_memory while the other DP ranks timed out waiting
+        # on the shm ring buffer collective, crashing the server.
+        if self.cache_config.kv_cache_memory_bytes is not None:
+            return False
+        return self.compilation_config.mode != CompilationMode.NONE
 
     def determine_available_memory(self) -> int:
         if self._should_warm_up_model():

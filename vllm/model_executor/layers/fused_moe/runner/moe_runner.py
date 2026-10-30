@@ -312,14 +312,14 @@ class MoERunner(MoERunnerInterface):
             # will switch to using the moe_forward custom op.
             return _moe_forward if self._shared_experts is None else _moe_forward_shared
 
-        if current_platform.is_cpu():
-            # CPU never touches the workspace manager (Monolithic experts
-            # skip it entirely; Modular experts' _allocate_buffers bypasses
-            # it too, see modular_kernel.py) -- the ContextVar-based lane
-            # lookup was the only part of this call graph Dynamo can't
-            # trace, so CPU can always call the fused-MoE op directly.
-            return _moe_forward if self._shared_experts is None else _moe_forward_shared
-
+        # CPU uses the same custom op as GPU. The layer is already registered
+        # in static_forward_context unconditionally (see
+        # register_layer_for_moe_forward_op above), and the fake_impl is a
+        # pure shape function that works for all platforms. This makes
+        # _forward_impl opaque to dynamo, preventing symbolic-int leakage
+        # from sp_local_sizes / _get_sizes during AOT/fullgraph compilation.
+        # The ContextVar-based workspace manager issue that motivated the old
+        # CPU branch is already handled in modular_kernel._allocate_buffers.
         return (
             torch.ops.vllm.moe_forward
             if self._shared_experts is None

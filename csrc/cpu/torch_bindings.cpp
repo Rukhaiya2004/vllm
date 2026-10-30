@@ -339,13 +339,13 @@ void cpu_gemm_wna16(const torch::Tensor& input, const torch::Tensor& q_weight,
 void prepack_moe_weight(const torch::Tensor& weight,
                         torch::Tensor& packed_weight, const std::string& isa);
 
-void cpu_fused_moe(torch::Tensor& output, const torch::Tensor& input,
-                   const torch::Tensor& w13, const torch::Tensor& w2,
-                   const std::optional<torch::Tensor>& w13_bias,
-                   const std::optional<torch::Tensor>& w2_bias,
-                   const torch::Tensor& topk_weights,
-                   const torch::Tensor& topk_id, const bool skip_weighted,
-                   const std::string& act, const std::string& isa);
+void cpu_fused_moe(
+    torch::Tensor& output, const torch::Tensor& input, const torch::Tensor& w13,
+    const torch::Tensor& w2, const std::optional<torch::Tensor>& w13_bias,
+    const std::optional<torch::Tensor>& w2_bias,
+    const torch::Tensor& topk_weights, const torch::Tensor& topk_id,
+    const bool skip_weighted, const std::string& act, const std::string& isa,
+    const std::optional<torch::Tensor>& expert_map = std::nullopt);
 
 void prepack_moe_weight_int8(const torch::Tensor& weight,
                              torch::Tensor& packed_weight,
@@ -929,7 +929,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "cpu_fused_moe(Tensor(a0!) output, Tensor input, Tensor w13, Tensor w2, "
       "Tensor? w13_bias, Tensor? w2_bias, Tensor topk_weights, Tensor topk_id, "
       "bool skip_weighted, "
-      "str act, str isa) -> ()");
+      "str act, str isa, Tensor? expert_map=None) -> ()");
   ops.impl("cpu_fused_moe", torch::kCPU, &cpu_fused_moe);
 
 #if (defined(ARM_I8MM_SUPPORT) && defined(ARM_BF16_SUPPORT) && \
