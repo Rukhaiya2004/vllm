@@ -410,6 +410,10 @@ def maybe_make_prepare_finalize(
         )
 
     elif moe.use_ag_rs_all2all_kernels and allow_new_interface:
+        # On CPU with EP, tell the AgRsAll2AllManager how many experts
+        # this layer has so it can enable the all_to_all_single fast path.
+        if current_platform.is_cpu() and hasattr(all2all_manager, "set_num_experts"):
+            all2all_manager.set_num_experts(moe.num_experts)
         prepare_finalize = make_moe_prepare_and_finalize_naive_dp_ep(
             use_monolithic=use_monolithic,
             is_sequence_parallel=moe.moe_parallel_config.is_sequence_parallel,

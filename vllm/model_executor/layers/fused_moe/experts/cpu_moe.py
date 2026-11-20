@@ -312,6 +312,7 @@ class CPUUnquantizedExperts(mk.FusedMoEExpertsModular):
             activation.value,
             self.isa,
             apply_router_weight_on_input,
+            expert_map=expert_map,
         )
 
 
