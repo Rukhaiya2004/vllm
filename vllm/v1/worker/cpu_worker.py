@@ -191,15 +191,13 @@ class CPUWorker(Worker):
         # VLLM_CPU_CI_ENV always skips warmup to save CI time.
         if envs.VLLM_CPU_CI_ENV:
             return False
-        # With eager (CompilationMode.NONE) execution and an explicit KV
-        # cache size, warmup serves no purpose: there's no compiled graph to
-        # prewarm, and the auto KV-cache-size calc below -- which relies on
-        # a warmup forward pass having already bumped RSS to a realistic
-        # steady-state value -- is bypassed whenever the size is explicit.
-        return not (
-            self.compilation_config.mode == CompilationMode.NONE
-            and self.cache_config.kv_cache_memory_bytes is not None
-        )
+        # With an explicit KV cache size the auto KV-cache-size calc below is
+        # bypassed, so the warmup forward pass serves no purpose. Skipping it
+        # for any compilation mode avoids AOT-compiling inside
+        # determine_available_memory, where DP ranks hang on the shm collective.
+        if self.cache_config.kv_cache_memory_bytes is not None:
+            return False
+        return self.compilation_config.mode != CompilationMode.NONE
 
     def determine_available_memory(self) -> int:
         if self._should_warm_up_model():
