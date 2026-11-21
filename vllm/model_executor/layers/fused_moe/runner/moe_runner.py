@@ -312,12 +312,14 @@ class MoERunner(MoERunnerInterface):
             # will switch to using the moe_forward custom op.
             return _moe_forward if self._shared_experts is None else _moe_forward_shared
 
-        if current_platform.is_cpu():
+        if current_platform.is_cpu() and not self.moe_config.use_ep:
             # CPU never touches the workspace manager (Monolithic experts
             # skip it entirely; Modular experts' _allocate_buffers bypasses
             # it too, see modular_kernel.py) -- the ContextVar-based lane
             # lookup was the only part of this call graph Dynamo can't
             # trace, so CPU can always call the fused-MoE op directly.
+            # Under EP the dispatch sizes are data-dependent, so the layer
+            # must stay opaque to Dynamo behind the custom op.
             return _moe_forward if self._shared_experts is None else _moe_forward_shared
 
         return (
