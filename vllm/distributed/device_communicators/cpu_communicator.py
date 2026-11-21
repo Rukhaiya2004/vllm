@@ -89,34 +89,50 @@ def _cpu_all_to_allv_impl(
     """Variable-size all-to-all: each rank sends input_split_sizes[r] rows to
     rank r, and receives output_split_sizes[r] rows from rank r.
 
-    Uses torch.distributed.all_to_all_single which gloo supports natively and
-    handles zero-size chunks correctly (unlike all_to_all which rejects
-    zero-row tensors).  One round-trip, no padding, no post-slice.
+    Implemented with point-to-point isend/irecv on raw bytes. gloo's
+    split-size ``all_to_all_single`` corrupts the heap on ppc64le when ranks
+    exchange uneven or empty chunks. Zero-row transfers are skipped.
     """
     pg = _CPU_EP_GROUP_REGISTRY[group_name]
+    rank = torch.distributed.get_rank(pg)
     rest = input_.shape[1:]
-    total_out = sum(output_split_sizes)
+    send_sizes = [int(s) for s in input_split_sizes]
+    recv_sizes = [int(s) for s in output_split_sizes]
+    total_out = sum(recv_sizes)
 
-    # Flatten trailing dims so all_to_all_single works on a 2-D tensor.
-    flat_size = 1
+    row_bytes = input_.element_size()
     for s in rest:
-        flat_size *= s
+        row_bytes *= s
 
-    flat_shape = (-1, flat_size) if flat_size > 1 else (-1,)
-    output = input_.new_empty(
-        (total_out, flat_size) if flat_size > 1 else (total_out,)
-    )
-    inp_flat = input_.contiguous().view(*flat_shape)
+    output = input_.new_empty((total_out,) + rest)
+    in_bytes = input_.contiguous().reshape(-1).view(torch.uint8)
+    out_bytes = output.reshape(-1).view(torch.uint8)
 
-    torch.distributed.all_to_all_single(
-        output,
-        inp_flat,
-        output_split_sizes=[int(s) for s in output_split_sizes],
-        input_split_sizes=[int(s) for s in input_split_sizes],
-        group=pg,
-    )
-    # Restore original trailing shape.
-    return output.view((total_out,) + rest)
+    send_off = 0
+    recv_off = 0
+    requests = []
+    for peer in range(len(send_sizes)):
+        send_end = send_off + send_sizes[peer]
+        recv_end = recv_off + recv_sizes[peer]
+        send_slice = in_bytes[send_off * row_bytes : send_end * row_bytes]
+        recv_slice = out_bytes[recv_off * row_bytes : recv_end * row_bytes]
+        send_off = send_end
+        recv_off = recv_end
+        if peer == rank:
+            recv_slice.copy_(send_slice)
+            continue
+        peer_global = torch.distributed.get_global_rank(pg, peer)
+        if recv_sizes[peer] > 0:
+            requests.append(
+                torch.distributed.irecv(recv_slice, src=peer_global, group=pg)
+            )
+        if send_sizes[peer] > 0:
+            requests.append(
+                torch.distributed.isend(send_slice, dst=peer_global, group=pg)
+            )
+    for req in requests:
+        req.wait()
+    return output
 
 
 def _cpu_all_to_allv_fake(
